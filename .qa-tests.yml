@@ -1,1 +1,166 @@
 
+name: HVAC Automated Playwright QA
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  playwright-qa:
+    name: Build and Automated QA
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 20
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate and extract project ZIP
+        shell: bash
+        run: |
+          echo "Searching for project ZIP..."
+
+          ZIP_FILE=$(find . -maxdepth 2 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "No ZIP file found."
+            exit 1
+          fi
+
+          echo "Found ZIP: $ZIP_FILE"
+
+          mkdir -p extracted-project
+          unzip -q "$ZIP_FILE" -d extracted-project
+
+          PACKAGE_DIR=$(find extracted-project -name package.json -type f | head -n 1 | xargs dirname)
+
+          if [ -z "$PACKAGE_DIR" ]; then
+            echo "package.json was not found after extraction."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PACKAGE_DIR" >> $GITHUB_ENV
+
+          echo "Project directory:"
+          echo "$PACKAGE_DIR"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/package-lock.json
+
+      - name: Install project dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build application
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: npm run build
+
+      - name: Install Playwright
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          npm install --no-save @playwright/test
+          npx playwright install --with-deps chromium
+
+      - name: Create Playwright configuration
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          cat > playwright.config.js <<'EOF'
+          const { defineConfig } = require('@playwright/test');
+
+          module.exports = defineConfig({
+            testDir: './tests',
+            timeout: 30000,
+
+            use: {
+              baseURL: 'http://127.0.0.1:4173',
+              headless: true,
+              screenshot: 'only-on-failure',
+              video: 'retain-on-failure',
+              trace: 'retain-on-failure'
+            },
+
+            reporter: [
+              ['list'],
+              ['html', { outputFolder: 'playwright-report', open: 'never' }]
+            ],
+
+            webServer: {
+              command: 'npm run preview -- --host 127.0.0.1',
+              url: 'http://127.0.0.1:4173',
+              reuseExistingServer: false,
+              timeout: 120000
+            }
+          });
+          EOF
+
+      - name: Create automated smoke tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p tests
+
+          cat > tests/application.spec.js <<'EOF'
+          const { test, expect } = require('@playwright/test');
+
+          test.describe('HVAC Opportunity Intelligence Platform - QA', () => {
+
+            test('application loads successfully', async ({ page }) => {
+              const response = await page.goto('/');
+              expect(response.status()).toBeLessThan(400);
+            });
+
+            test('page has visible content', async ({ page }) => {
+              await page.goto('/');
+              await expect(page.locator('body')).toBeVisible();
+            });
+
+            test('page has a title', async ({ page }) => {
+              await page.goto('/');
+              await expect(page).toHaveTitle(/.+/);
+            });
+
+            test('no critical page load errors', async ({ page }) => {
+              const errors = [];
+
+              page.on('pageerror', error => {
+                errors.push(error.message);
+              });
+
+              await page.goto('/');
+              await page.waitForTimeout(2000);
+
+              expect(errors).toEqual([]);
+            });
+
+          });
+          EOF
+
+      - name: Run Playwright automated QA
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-qa-report
+          path: |
+            ${{ env.PROJECT_DIR }}/playwright-report/
+            ${{ env.PROJECT_DIR }}/test-results/
+          retention-days: 14
